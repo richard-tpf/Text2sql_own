@@ -27,7 +27,7 @@ from vanna.integrations.openai import OpenAILlmService
 # 1. 配置 LLM（DeepSeek-R1，通过 SiliconFlow）
 # ============================================================
 llm = OpenAILlmService(
-    model="deepseek-ai/DeepSeek-R1",
+    model="deepseek-ai/DeepSeek-V3.2",
     base_url="https://api.siliconflow.cn/v1",
     api_key="sk-mtagmphpopbjpgngeludixffwdeicktszmsxtovwgslswlng"  # TODO: 替换为你的 API Key
 )

@@ -21,6 +21,7 @@ from pymilvus import (
     DataType,
     utility,
 )
+from pymilvus.exceptions import MilvusException
 from langchain_huggingface import HuggingFaceEmbeddings
 
 
@@ -76,6 +77,7 @@ class MilvusSchemaKnowledgeBase:
         self._collection = None
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._embed_model = None
+        self._metric_type: Optional[str] = None  # collection index's metric_type (IP/COSINE)
 
     def _get_embed_model(self):
         if self._embed_model is None:
@@ -146,10 +148,27 @@ class MilvusSchemaKnowledgeBase:
                     "params": {"nlist": 128},
                 }
                 collection.create_index(field_name="embedding", index_params=index_params)
+                self._metric_type = index_params.get("metric_type")
                 self._collection = collection
             else:
                 self._collection = Collection(self.collection_name, using=self.alias)
             self._collection.load()
+            # For existing collections, index metric_type may not be IP (e.g. COSINE).
+            # Detect it so search won't fail with "metric type not match".
+            if self._metric_type is None:
+                try:
+                    indexes = getattr(self._collection, "indexes", None) or []
+                    for idx in indexes:
+                        mt = getattr(idx, "metric_type", None)
+                        if mt:
+                            self._metric_type = mt
+                            break
+                        if isinstance(idx, dict) and idx.get("metric_type"):
+                            self._metric_type = idx["metric_type"]
+                            break
+                except Exception:
+                    # Keep default; search params can still fall back to IP.
+                    pass
         return self._collection
 
     async def save_schema(
@@ -206,15 +225,47 @@ class MilvusSchemaKnowledgeBase:
             if layer_filter:
                 exprs.append(f'layer == "{layer_filter}"')
             expr = " and ".join(exprs) if exprs else None
-            search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
-            results = collection.search(
-                data=[embedding],
-                anns_field="embedding",
-                param=search_params,
-                limit=limit,
-                expr=expr,
-                output_fields=["id", "table_name", "layer", "ddl", "source_tables", "timestamp"],
-            )
+            # 先不显式传 metric_type，避免与已有集合 index 不一致导致失败。
+            search_params = {"params": {"nprobe": 10}}
+            try:
+                results = collection.search(
+                    data=[embedding],
+                    anns_field="embedding",
+                    param=search_params,
+                    limit=limit,
+                    expr=expr,
+                    output_fields=[
+                        "id",
+                        "table_name",
+                        "layer",
+                        "ddl",
+                        "source_tables",
+                        "timestamp",
+                    ],
+                )
+            except MilvusException as e:
+                # 如果返回 "expected=XXX][actual=YYY"，自动提取 expected 作为 retry metric_type
+                msg = str(e)
+                m = re.search(r"expected=([A-Za-z]+).*actual=([A-Za-z]+)", msg)
+                if not m:
+                    raise
+                expected_metric = m.group(1)
+                retry_params = {"metric_type": expected_metric, "params": {"nprobe": 10}}
+                results = collection.search(
+                    data=[embedding],
+                    anns_field="embedding",
+                    param=retry_params,
+                    limit=limit,
+                    expr=expr,
+                    output_fields=[
+                        "id",
+                        "table_name",
+                        "layer",
+                        "ddl",
+                        "source_tables",
+                        "timestamp",
+                    ],
+                )
             search_results = []
             for hits in results:
                 for rank, hit in enumerate(hits):
@@ -263,6 +314,7 @@ class MilvusBusinessKnowledgeBase:
         self._collection = None
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._embed_model = None
+        self._metric_type: Optional[str] = None  # collection index's metric_type (IP/COSINE)
 
     def _get_embed_model(self):
         """懒加载嵌入模型（全局共享）。"""
@@ -273,6 +325,18 @@ class MilvusBusinessKnowledgeBase:
     def _create_embedding(self, text: str) -> List[float]:
         """生成文本向量。"""
         return self._get_embed_model().embed_query(text)
+
+    @staticmethod
+    def _build_embedding_text(content: str, title: str = "", knowledge_type: str = "") -> str:
+        """构建用于向量化的文本，合并标题+类型+正文，提升按标题检索命中率。"""
+        parts = []
+        if title:
+            parts.append(title)
+        if knowledge_type:
+            parts.append(knowledge_type)
+        if content:
+            parts.append(content)
+        return "\n".join(parts)
 
     def _get_collection(self):
         """获取或创建 Milvus 集合。"""
@@ -300,11 +364,26 @@ class MilvusBusinessKnowledgeBase:
                     "params": {"nlist": 128},
                 }
                 collection.create_index(field_name="embedding", index_params=index_params)
+                self._metric_type = index_params.get("metric_type")
                 self._collection = collection
             else:
                 self._collection = Collection(self.collection_name, using=self.alias)
 
             self._collection.load()
+            # For existing collections, detect index metric_type so search matches.
+            if self._metric_type is None:
+                try:
+                    indexes = getattr(self._collection, "indexes", None) or []
+                    for idx in indexes:
+                        mt = getattr(idx, "metric_type", None)
+                        if mt:
+                            self._metric_type = mt
+                            break
+                        if isinstance(idx, dict) and idx.get("metric_type"):
+                            self._metric_type = idx["metric_type"]
+                            break
+                except Exception:
+                    pass
         return self._collection
 
     async def save_knowledge(
@@ -318,7 +397,10 @@ class MilvusBusinessKnowledgeBase:
             collection = self._get_collection()
             knowledge_id = str(uuid.uuid4())
             timestamp = datetime.now().isoformat()
-            embedding = self._create_embedding(content)
+            embedding_text = self._build_embedding_text(
+                content=content, title=title, knowledge_type=knowledge_type
+            )
+            embedding = self._create_embedding(embedding_text)
             entities = [
                 [knowledge_id],
                 [embedding],
@@ -342,7 +424,7 @@ class MilvusBusinessKnowledgeBase:
         self,
         query: str,
         limit: int = 5,
-        similarity_threshold: float = 0.5,
+        similarity_threshold: float = 0.35,
         knowledge_type: Optional[str] = None,
     ) -> List[KnowledgeSearchResult]:
         """搜索知识库。"""
@@ -352,15 +434,44 @@ class MilvusBusinessKnowledgeBase:
             expr = None
             if knowledge_type:
                 expr = f'knowledge_type == "{knowledge_type}"'
-            search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
-            results = collection.search(
-                data=[embedding],
-                anns_field="embedding",
-                param=search_params,
-                limit=limit,
-                expr=expr,
-                output_fields=["id", "content", "knowledge_type", "title", "timestamp"],
-            )
+            # 先不显式传 metric_type，避免与已有集合 index 不一致导致失败。
+            search_params = {"params": {"nprobe": 10}}
+            try:
+                results = collection.search(
+                    data=[embedding],
+                    anns_field="embedding",
+                    param=search_params,
+                    limit=limit,
+                    expr=expr,
+                    output_fields=[
+                        "id",
+                        "content",
+                        "knowledge_type",
+                        "title",
+                        "timestamp",
+                    ],
+                )
+            except MilvusException as e:
+                msg = str(e)
+                m = re.search(r"expected=([A-Za-z]+).*actual=([A-Za-z]+)", msg)
+                if not m:
+                    raise
+                expected_metric = m.group(1)
+                retry_params = {"metric_type": expected_metric, "params": {"nprobe": 10}}
+                results = collection.search(
+                    data=[embedding],
+                    anns_field="embedding",
+                    param=retry_params,
+                    limit=limit,
+                    expr=expr,
+                    output_fields=[
+                        "id",
+                        "content",
+                        "knowledge_type",
+                        "title",
+                        "timestamp",
+                    ],
+                )
             search_results = []
             for hits in results:
                 for rank, hit in enumerate(hits):
@@ -475,7 +586,7 @@ class DualKnowledgeBaseManager:
         self,
         query: str,
         limit: int = 5,
-        similarity_threshold: float = 0.5,
+        similarity_threshold: float = 0.35,
         knowledge_type: Optional[str] = None,
     ) -> List[KnowledgeSearchResult]:
         """搜索业务文档知识库。"""
